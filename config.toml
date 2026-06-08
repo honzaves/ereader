@@ -1,0 +1,8 @@
+# EPUB Reader settings — edit and restart the app to apply changes.
+
+font_family = ""        # system font name, e.g. "Georgia". Leave empty for default.
+font_size = 15          # body text size in points
+sidebar_bg = "#1a1a1e"  # sidebar background colour (hex)
+reader_bg  = "#121212"  # reader panel background colour (hex)
+text_color = "#333333"  # body text colour (hex)
+starting_folder = "/Users/jan/Documents/Books"    # auto-open this folder on startup (full path)
