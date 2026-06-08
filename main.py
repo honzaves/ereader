@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -77,6 +79,59 @@ def load_config() -> Config:
         text_color=data.get("text_color", "#1a1a1a"),
         starting_folder=data.get("starting_folder", ""),
     )
+
+
+# ── Session state (folder history) ──────────────────────────────────────────
+
+SESSION_PATH = Path(__file__).parent / ".last_session.json"
+HISTORY_LIMIT = 10
+
+
+def _normalize_folder(path: str) -> str:
+    """Canonicalise a folder path so the same folder can't appear twice."""
+    return str(Path(path).resolve())
+
+
+def add_to_history(history: list[str], folder: str,
+                   limit: int = HISTORY_LIMIT) -> list[str]:
+    """Return history with `folder` moved/inserted at the front, deduped and capped."""
+    norm = _normalize_folder(folder)
+    result = [norm]
+    result.extend(p for p in history if _normalize_folder(p) != norm)
+    return result[:limit]
+
+
+def prune_history(history: list[str]) -> list[str]:
+    """Normalise, drop duplicates, and drop entries that aren't existing dirs."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for p in history:
+        norm = _normalize_folder(p)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if Path(norm).is_dir():
+            result.append(norm)
+    return result
+
+
+def load_history(session_path: Path = SESSION_PATH) -> list[str]:
+    """Read the persisted folder history; return [] if missing/unreadable/corrupt."""
+    try:
+        data = json.loads(Path(session_path).read_text())
+    except (OSError, ValueError):
+        return []
+    hist = data.get("folder_history", []) if isinstance(data, dict) else []
+    return [p for p in hist if isinstance(p, str)]
+
+
+def save_history(history: list[str], session_path: Path = SESSION_PATH) -> None:
+    """Persist the folder history as JSON; silently no-op on write errors."""
+    try:
+        Path(session_path).write_text(
+            json.dumps({"folder_history": history}, indent=2))
+    except OSError:
+        pass
 
 
 # ── Book metadata ─────────────────────────────────────────────────────────────
@@ -336,13 +391,21 @@ class ReaderWindow(QMainWindow):
         self._img_dir.mkdir()
         self._page_counter = [0]
 
+        # Load folder history and drop folders that no longer exist.
+        self._history = prune_history(load_history())
+        save_history(self._history)
+
         self.setWindowTitle("EPUB Reader")
         self.resize(1400, 800)
 
         self._build_ui()
         self._apply_styles()
+        self._refresh_recent_combo()
 
-        if cfg.starting_folder and Path(cfg.starting_folder).is_dir():
+        # Startup: last-opened wins, then the configured default folder.
+        if self._history:
+            self._load_folder(self._history[0])
+        elif self._has_valid_default():
             self._load_folder(cfg.starting_folder)
 
     def _build_ui(self):
@@ -369,6 +432,20 @@ class ReaderWindow(QMainWindow):
         open_btn.setObjectName("openBtn")
         open_btn.clicked.connect(self._pick_folder)
 
+        self._default_btn = QPushButton("Open Default")
+        self._default_btn.setObjectName("openBtn")
+        self._default_btn.clicked.connect(self._open_default_folder)
+        self._default_btn.setEnabled(self._has_valid_default())
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addWidget(open_btn)
+        btn_row.addWidget(self._default_btn)
+
+        self._recent_combo = QComboBox()
+        self._recent_combo.setObjectName("recentCombo")
+        self._recent_combo.activated.connect(self._on_recent_selected)
+
         self._book_list = QListWidget()
         self._book_list.setObjectName("bookList")
         self._book_list.itemClicked.connect(self._on_book_clicked)
@@ -377,7 +454,8 @@ class ReaderWindow(QMainWindow):
         sidebar_layout.setContentsMargins(12, 12, 12, 12)
         sidebar_layout.setSpacing(8)
         sidebar_layout.addWidget(title)
-        sidebar_layout.addWidget(open_btn)
+        sidebar_layout.addLayout(btn_row)
+        sidebar_layout.addWidget(self._recent_combo)
         sidebar_layout.addWidget(self._folder_label)
         sidebar_layout.addWidget(self._book_list)
 
@@ -448,6 +526,28 @@ class ReaderWindow(QMainWindow):
             }}
             QPushButton#openBtn:pressed {{
                 background-color: #4a4a4e;
+            }}
+            QPushButton#openBtn:disabled {{
+                background-color: #232327;
+                color: #666;
+                border-color: #2a2a2e;
+            }}
+            QComboBox#recentCombo {{
+                background-color: #2a2a2e;
+                color: {cfg.sidebar_text};
+                border: 1px solid #3a3a3e;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+            }}
+            QComboBox#recentCombo:disabled {{
+                background-color: #232327;
+                color: #666;
+            }}
+            QComboBox#recentCombo QAbstractItemView {{
+                background-color: {cfg.sidebar_bg};
+                color: {cfg.sidebar_text};
+                selection-background-color: #2d3748;
             }}
             QListWidget#bookList {{
                 background-color: {cfg.sidebar_bg};
@@ -568,6 +668,53 @@ class ReaderWindow(QMainWindow):
         # which otherwise insets and clips the widget.
         return widget, QSize(width, total_h + self._ITEM_BORDER)
 
+    def _has_valid_default(self) -> bool:
+        return bool(self._cfg.starting_folder) and \
+            Path(self._cfg.starting_folder).is_dir()
+
+    def _open_default_folder(self):
+        if self._has_valid_default():
+            self._load_folder(self._cfg.starting_folder)
+
+    def _on_recent_selected(self, index: int):
+        path = self._recent_combo.itemData(index)
+        if path:
+            self._load_folder(path)
+
+    def _record_history(self, folder: str):
+        self._history = add_to_history(self._history, folder)
+        save_history(self._history)
+        self._refresh_recent_combo(current=folder)
+
+    def _drop_from_history(self, folder: str):
+        norm = _normalize_folder(folder)
+        self._history = [p for p in self._history
+                         if _normalize_folder(p) != norm]
+        save_history(self._history)
+        self._refresh_recent_combo()
+
+    def _refresh_recent_combo(self, current: str | None = None):
+        # Rebuilt with signals blocked so programmatic changes don't fire
+        # `activated` (which is user-action only) and re-trigger a load.
+        combo = self._recent_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if self._history:
+            combo.setEnabled(True)
+            for p in self._history:
+                combo.addItem(Path(p).name, p)
+                combo.setItemData(combo.count() - 1, p, Qt.ItemDataRole.ToolTipRole)
+            idx = 0
+            if current is not None:
+                norm = _normalize_folder(current)
+                idx = next((i for i, p in enumerate(self._history)
+                            if _normalize_folder(p) == norm), 0)
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setEnabled(False)
+            combo.addItem("No recent folders")
+        combo.blockSignals(False)
+
     def _pick_folder(self):
         initial = (self._cfg.starting_folder
                    if self._cfg.starting_folder and Path(self._cfg.starting_folder).is_dir()
@@ -584,14 +731,25 @@ class ReaderWindow(QMainWindow):
         self._toc_tree.clear()
         folder_path = Path(folder)
 
+        # The folder may have been moved/deleted/unmounted since it was recorded.
+        if not folder_path.is_dir():
+            self._book_list.clear()
+            self._book_list.addItem(QListWidgetItem(
+                "Folder not found — it may have been moved or deleted"))
+            self._drop_from_history(folder)
+            return
+
         try:
             epubs = sorted(p for p in folder_path.iterdir()
                            if p.suffix.lower() == ".epub")
-        except PermissionError as exc:
+        except OSError as exc:
             self._book_list.clear()
-            item = QListWidgetItem(f"Permission denied: {exc.filename}")
-            self._book_list.addItem(item)
+            self._book_list.addItem(QListWidgetItem(
+                f"Could not open folder: {exc.strerror or exc}"))
             return
+
+        # Folder opened successfully — remember it in the history.
+        self._record_history(folder)
 
         self._book_list.clear()
         self._show_status("<p>Select a book from the sidebar</p>")
