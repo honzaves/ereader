@@ -1,0 +1,365 @@
+"""The main reader window: sidebar (folder/book/recent), TOC panel, and webview."""
+
+import tempfile
+from pathlib import Path
+
+from PySide6.QtCore import QSize, Qt, QUrl
+from PySide6.QtGui import QColor
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QPushButton,
+    QStyle,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+import history
+from config import Config
+from epub_content import read_epub_meta, status_html
+from loader import BookLoader
+from styles import sidebar_stylesheet
+
+SIDEBAR_WIDTH = 280
+
+
+class ReaderWindow(QMainWindow):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self._cfg = cfg
+        self._loader: BookLoader | None = None
+        self._session_dir = Path(tempfile.mkdtemp(prefix="ereader_"))
+        self._img_dir = self._session_dir / "img"
+        self._img_dir.mkdir()
+        self._page_counter = [0]
+
+        # Load folder history and drop folders that no longer exist.
+        self._history = history.prune_history(history.load_history())
+        history.save_history(self._history)
+
+        self.setWindowTitle("EPUB Reader")
+        self.resize(1400, 800)
+
+        self._build_ui()
+        self._apply_styles()
+        self._refresh_recent_combo()
+
+        # Startup: last-opened wins, then the configured default folder.
+        if self._history:
+            self._load_folder(self._history[0])
+        elif self._has_valid_default():
+            self._load_folder(cfg.starting_folder)
+
+    def _build_ui(self):
+        cfg = self._cfg
+
+        # ── WebView ───────────────────────────────────────────────────────────
+        self._view = QWebEngineView()
+        self._view.page().setBackgroundColor(QColor(cfg.book_bg))
+        self._show_status("<p>Select a book from the sidebar</p>")
+
+        # ── Sidebar ───────────────────────────────────────────────────────────
+        sidebar = QWidget()
+        sidebar.setFixedWidth(SIDEBAR_WIDTH)
+        sidebar.setObjectName("sidebar")
+
+        title = QLabel("📚 EPUB Reader")
+        title.setObjectName("sidebarTitle")
+
+        self._folder_label = QLabel("")
+        self._folder_label.setObjectName("folderLabel")
+        self._folder_label.setWordWrap(True)
+
+        open_btn = QPushButton("Open Folder")
+        open_btn.setObjectName("openBtn")
+        open_btn.clicked.connect(self._pick_folder)
+
+        self._default_btn = QPushButton("Open Default")
+        self._default_btn.setObjectName("openBtn")
+        self._default_btn.clicked.connect(self._open_default_folder)
+        self._default_btn.setEnabled(self._has_valid_default())
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addWidget(open_btn)
+        btn_row.addWidget(self._default_btn)
+
+        self._recent_combo = QComboBox()
+        self._recent_combo.setObjectName("recentCombo")
+        self._recent_combo.activated.connect(self._on_recent_selected)
+
+        self._book_list = QListWidget()
+        self._book_list.setObjectName("bookList")
+        self._book_list.itemClicked.connect(self._on_book_clicked)
+
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(12, 12, 12, 12)
+        sidebar_layout.setSpacing(8)
+        sidebar_layout.addWidget(title)
+        sidebar_layout.addLayout(btn_row)
+        sidebar_layout.addWidget(self._recent_combo)
+        sidebar_layout.addWidget(self._folder_label)
+        sidebar_layout.addWidget(self._book_list)
+
+        # ── TOC panel ─────────────────────────────────────────────────────────
+        self._toc_panel = QWidget()
+        self._toc_panel.setFixedWidth(240)
+        self._toc_panel.setObjectName("tocPanel")
+        self._toc_panel.setVisible(False)
+
+        toc_header = QLabel("Contents")
+        toc_header.setObjectName("tocHeader")
+
+        self._toc_tree = QTreeWidget()
+        self._toc_tree.setObjectName("tocTree")
+        self._toc_tree.setHeaderHidden(True)
+        self._toc_tree.setIndentation(14)
+        self._toc_tree.setAnimated(True)
+        self._toc_tree.itemClicked.connect(self._on_toc_item_clicked)
+
+        toc_layout = QVBoxLayout(self._toc_panel)
+        toc_layout.setContentsMargins(10, 12, 10, 12)
+        toc_layout.setSpacing(8)
+        toc_layout.addWidget(toc_header)
+        toc_layout.addWidget(self._toc_tree)
+
+        # ── Root layout ───────────────────────────────────────────────────────
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(sidebar)
+        root_layout.addWidget(self._toc_panel)
+        root_layout.addWidget(self._view, stretch=1)
+        self.setCentralWidget(root)
+
+    def _apply_styles(self):
+        self.setStyleSheet(sidebar_stylesheet(self._cfg))
+
+    # ── Folder loading ────────────────────────────────────────────────────────
+
+    # Font sizes (px) are the single source of truth for both rendering and
+    # height measurement — keep them off the stylesheet so the two can't drift.
+    _TITLE_PX = 13
+    _AUTHOR_PX = 11
+    _ITEM_BORDER = 1   # bookList ::item border-bottom; insets the widget by 1px
+
+    def _book_item_width(self) -> int:
+        """Usable width for an item widget inside the fixed-width sidebar."""
+        list_w = SIDEBAR_WIDTH - 24       # sidebar layout margins (12 + 12)
+        scrollbar = self._book_list.style().pixelMetric(
+            QStyle.PixelMetric.PM_ScrollBarExtent)
+        return list_w - scrollbar         # bias narrower → wraps earlier → never clips
+
+    def _make_book_widget(self, title: str, author: str, width: int) -> tuple[QWidget, QSize]:
+        h_margin, v_margin, spacing = 6, 8, 2
+        inner = width - 2 * h_margin
+
+        widget = QWidget()
+        widget.setObjectName("bookItemWidget")
+        widget.setFixedWidth(width)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(h_margin, v_margin, h_margin, v_margin)
+        layout.setSpacing(spacing)
+
+        title_lbl = QLabel(title)
+        title_lbl.setObjectName("bookItemTitle")
+        title_lbl.setWordWrap(True)
+        tf = title_lbl.font()
+        tf.setPixelSize(self._TITLE_PX)
+        title_lbl.setFont(tf)
+        layout.addWidget(title_lbl)
+
+        total_h = 2 * v_margin + title_lbl.heightForWidth(inner)
+
+        if author:
+            author_lbl = QLabel(author)
+            author_lbl.setObjectName("bookItemAuthor")
+            author_lbl.setWordWrap(True)
+            af = author_lbl.font()
+            af.setPixelSize(self._AUTHOR_PX)
+            author_lbl.setFont(af)
+            layout.addWidget(author_lbl)
+            total_h += spacing + author_lbl.heightForWidth(inner)
+
+        # The row height (this size hint) must also cover the item's border,
+        # which otherwise insets and clips the widget.
+        return widget, QSize(width, total_h + self._ITEM_BORDER)
+
+    def _has_valid_default(self) -> bool:
+        return bool(self._cfg.starting_folder) and \
+            Path(self._cfg.starting_folder).is_dir()
+
+    def _open_default_folder(self):
+        if self._has_valid_default():
+            self._load_folder(self._cfg.starting_folder)
+
+    def _on_recent_selected(self, index: int):
+        path = self._recent_combo.itemData(index)
+        if path:
+            self._load_folder(path)
+
+    def _record_history(self, folder: str):
+        self._history = history.add_to_history(self._history, folder)
+        history.save_history(self._history)
+        self._refresh_recent_combo(current=folder)
+
+    def _drop_from_history(self, folder: str):
+        norm = history.normalize_folder(folder)
+        self._history = [p for p in self._history
+                         if history.normalize_folder(p) != norm]
+        history.save_history(self._history)
+        self._refresh_recent_combo()
+
+    def _refresh_recent_combo(self, current: str | None = None):
+        # Rebuilt with signals blocked so programmatic changes don't fire
+        # `activated` (which is user-action only) and re-trigger a load.
+        combo = self._recent_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if self._history:
+            combo.setEnabled(True)
+            for p in self._history:
+                combo.addItem(Path(p).name, p)
+                combo.setItemData(combo.count() - 1, p, Qt.ItemDataRole.ToolTipRole)
+            idx = 0
+            if current is not None:
+                norm = history.normalize_folder(current)
+                idx = next((i for i, p in enumerate(self._history)
+                            if history.normalize_folder(p) == norm), 0)
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setEnabled(False)
+            combo.addItem("No recent folders")
+        combo.blockSignals(False)
+
+    def _pick_folder(self):
+        initial = (self._cfg.starting_folder
+                   if self._cfg.starting_folder and Path(self._cfg.starting_folder).is_dir()
+                   else "")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select EPUB folder", initial
+        )
+        if folder:
+            self._load_folder(folder)
+
+    def _load_folder(self, folder: str):
+        self._folder_label.setText(folder)
+        self._toc_panel.setVisible(False)
+        self._toc_tree.clear()
+        folder_path = Path(folder)
+
+        # The folder may have been moved/deleted/unmounted since it was recorded.
+        if not folder_path.is_dir():
+            self._book_list.clear()
+            self._book_list.addItem(QListWidgetItem(
+                "Folder not found — it may have been moved or deleted"))
+            self._drop_from_history(folder)
+            return
+
+        try:
+            epubs = sorted(p for p in folder_path.iterdir()
+                           if p.suffix.lower() == ".epub")
+        except OSError as exc:
+            self._book_list.clear()
+            self._book_list.addItem(QListWidgetItem(
+                f"Could not open folder: {exc.strerror or exc}"))
+            return
+
+        # Folder opened successfully — remember it in the history.
+        self._record_history(folder)
+
+        self._book_list.clear()
+        self._show_status("<p>Select a book from the sidebar</p>")
+
+        if not epubs:
+            self._book_list.addItem(QListWidgetItem("No EPUB files found"))
+            return
+
+        metas = sorted((read_epub_meta(ep) for ep in epubs), key=lambda m: m.sort_key)
+        item_width = self._book_item_width()
+        for meta in metas:
+            size_kb = meta.path.stat().st_size // 1024
+            item = QListWidgetItem()
+            item.setToolTip(f"{meta.path.name}  •  {size_kb} KB")
+            item.setData(256, str(meta.path))
+            self._book_list.addItem(item)
+            widget, hint = self._make_book_widget(meta.title, meta.author, item_width)
+            item.setSizeHint(hint)
+            self._book_list.setItemWidget(item, widget)
+
+    # ── Book loading ──────────────────────────────────────────────────────────
+
+    def _on_book_clicked(self, item: QListWidgetItem):
+        path = item.data(256)
+        if not path:
+            return
+        self._show_status("<p>Loading…</p>")
+        self._toc_panel.setVisible(False)
+
+        if self._loader and self._loader.isRunning():
+            self._loader.quit()
+            self._loader.wait()
+        self._loader = BookLoader(
+            path, self._img_dir, self._session_dir, self._cfg, self._page_counter
+        )
+        self._loader.loaded.connect(self._on_book_loaded)
+        self._loader.failed.connect(self._on_book_failed)
+        self._loader.start()
+
+    def _on_book_loaded(self, file_path: str, toc: list):
+        self._view.load(QUrl.fromLocalFile(file_path))
+        self._populate_toc(toc)
+        self._toc_panel.setVisible(bool(toc))
+
+    def _on_book_failed(self, error: str):
+        self._show_status(f'<p style="color:#f88">Failed to load: {error}</p>')
+
+    # ── TOC ───────────────────────────────────────────────────────────────────
+
+    def _populate_toc(self, entries: list):
+        self._toc_tree.clear()
+
+        def add_items(parent, items):
+            for entry in items:
+                if isinstance(parent, QTreeWidget):
+                    node = QTreeWidgetItem(parent)
+                else:
+                    node = QTreeWidgetItem(parent)
+                node.setText(0, entry.title)
+                node.setData(0, Qt.ItemDataRole.UserRole, entry.anchor)
+                node.setToolTip(0, entry.title)
+                if entry.children:
+                    add_items(node, entry.children)
+                    node.setExpanded(False)
+
+        add_items(self._toc_tree, entries)
+
+    def _on_toc_item_clicked(self, item: QTreeWidgetItem, _column: int):
+        if item.childCount() and not item.isExpanded():
+            # First click on a collapsed parent: expand it
+            item.setExpanded(True)
+            return
+        anchor = item.data(0, Qt.ItemDataRole.UserRole)
+        if not anchor:
+            return
+        frag = anchor.lstrip("#")
+        self._view.page().runJavaScript(
+            f"(function(){{"
+            f"  var el = document.getElementById('{frag}');"
+            f"  if (el) el.scrollIntoView({{behavior: 'smooth', block: 'start'}});"
+            f"}})();"
+        )
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _show_status(self, body: str):
+        self._view.setHtml(status_html(body, self._cfg))
